@@ -484,6 +484,8 @@ func buildClientTimingOptions(options option.OpenVPNClientEndpointOptions) ovpn.
 }
 
 func (c *ClientEndpoint) transportDialContextWithAddressIndex(ctx context.Context, network string, address string, addressIndex int) (net.Conn, error) {
+	// The client reports no event when it loses its session; the dial for the next attempt is the first point where the loss is visible here.
+	c.notifyStatusUpdated()
 	destination := M.ParseSocksaddr(address)
 	if destination.IsDomain() {
 		destinationAddresses, lookupErr := c.dnsRouter.Lookup(ctx, destination.Fqdn, c.queryOptions)

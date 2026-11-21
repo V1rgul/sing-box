@@ -31,6 +31,21 @@ type OutboundWithMultiplex interface {
 	MultiplexEnabled() bool
 }
 
+type ConnectionState uint8
+
+const (
+	ConnectionStateDisconnected ConnectionState = iota
+	ConnectionStateConnected
+	ConnectionStateFailed
+)
+
+type OutboundWithConnectionState interface {
+	Outbound
+	ConnectionState() ConnectionState
+	ConnectionStateUpdated() <-chan struct{}
+	MonitorConnection() (release func())
+}
+
 type FlowOutbound interface {
 	Outbound
 	tun.Port

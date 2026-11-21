@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/service/powerreport"
@@ -43,6 +44,15 @@ type Endpoint struct {
 	stateAccess    sync.Mutex
 	suspended      atomic.Bool
 	networkPaused  bool
+	sessionAccess  sync.Mutex
+	sessionStates  map[device.NoisePublicKey]device.PeerSessionState
+	connected      bool
+	sessionUpdated chan struct{}
+	monitors       atomic.Int32
+	monitorWake    chan struct{}
+	monitorDone    chan struct{}
+	monitorGroup   sync.WaitGroup
+	revalidate     atomic.Bool
 }
 
 func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
@@ -109,11 +119,22 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
 	if options.MTU == 0 {
 		options.MTU = 1408
 	}
+	sessionStates := make(map[device.NoisePublicKey]device.PeerSessionState)
+	for _, peer := range peers {
+		if peer.endpoint.IsValid() || peer.destination.IsDomain() {
+			sessionStates[peer.publicKey] = device.PeerSessionNone
+		}
+	}
 	return &Endpoint{
 		options:        options,
 		peers:          peers,
 		ipcConf:        ipcConf,
 		allowedAddress: allowedAddresses,
+		sessionStates:  sessionStates,
+		connected:      len(sessionStates) == 0,
+		sessionUpdated: make(chan struct{}),
+		monitorWake:    make(chan struct{}, 1),
+		monitorDone:    make(chan struct{}),
 	}, nil
 }
 
@@ -218,6 +239,8 @@ func (e *Endpoint) Start(postStart bool) error {
 		},
 	}
 	wgDevice := device.NewDevice(e.options.Context, e.returnDevice, bind, logger, e.options.Workers)
+	// Session states are not replayed, so the callback must be installed before IpcSet creates the peers.
+	wgDevice.SetSessionStateFunc(e.onSessionState)
 	domainPeers := make(map[device.NoisePublicKey]*peerConfig)
 	for peerIndex, peer := range e.peers {
 		if peer.destination.IsDomain() {
@@ -273,6 +296,8 @@ func (e *Endpoint) Start(postStart bool) error {
 		e.pauseCallback = e.pause.RegisterCallback(e.onPauseUpdated)
 	}
 	e.allowedIPs = wgDevice.AllowedIPs()
+	e.monitorGroup.Add(1)
+	go e.loopMonitor()
 	return nil
 }
 
@@ -330,10 +355,19 @@ func (e *Endpoint) resumeLocked(wgDevice *device.Device) {
 	e.suspended.Store(false)
 	if !e.networkPaused {
 		wgDevice.Up()
+		e.wakeMonitor()
 	}
 }
 
 func (e *Endpoint) Close() error {
+	e.stateAccess.Lock()
+	select {
+	case <-e.monitorDone:
+	default:
+		close(e.monitorDone)
+	}
+	e.stateAccess.Unlock()
+	e.monitorGroup.Wait()
 	if e.pauseCallback != nil {
 		e.pause.UnregisterCallback(e.pauseCallback)
 		e.pauseCallback = nil
@@ -367,13 +401,138 @@ func (e *Endpoint) BindUpdate() error {
 	if wgDevice == nil {
 		return nil
 	}
-	return wgDevice.BindUpdate()
+	err := wgDevice.BindUpdate()
+	if err != nil {
+		return err
+	}
+	// An established session survives a bind update although the new path may drop UDP, and a rekey of an established session does not change its observable state, so the monitor expires the keypairs to force a fresh handshake through the new socket as soon as the endpoint is monitored and active.
+	e.revalidate.Store(true)
+	e.wakeMonitor()
+	return nil
+}
+
+func (e *Endpoint) Connected() bool {
+	e.sessionAccess.Lock()
+	defer e.sessionAccess.Unlock()
+	return e.connected
+}
+
+func (e *Endpoint) ConnectedUpdated() <-chan struct{} {
+	e.sessionAccess.Lock()
+	defer e.sessionAccess.Unlock()
+	return e.sessionUpdated
+}
+
+func (e *Endpoint) Monitor() func() {
+	if e.monitors.Add(1) == 1 {
+		e.wakeMonitor()
+	}
+	return sync.OnceFunc(func() {
+		e.monitors.Add(-1)
+	})
+}
+
+// Called by wireguard-go under the peer's session state lock: it must not call back into the device.
+func (e *Endpoint) onSessionState(publicKey device.NoisePublicKey, state device.PeerSessionState) {
+	e.sessionAccess.Lock()
+	_, loaded := e.sessionStates[publicKey]
+	if loaded {
+		e.sessionStates[publicKey] = state
+		connected := true
+		for _, peerState := range e.sessionStates {
+			if peerState != device.PeerSessionEstablished {
+				connected = false
+				break
+			}
+		}
+		if connected != e.connected {
+			e.connected = connected
+			close(e.sessionUpdated)
+			e.sessionUpdated = make(chan struct{})
+		}
+	}
+	e.sessionAccess.Unlock()
+	if loaded && (state == device.PeerSessionNone || state == device.PeerSessionExpired) {
+		e.wakeMonitor()
+	}
+}
+
+func (e *Endpoint) wakeMonitor() {
+	select {
+	case e.monitorWake <- struct{}{}:
+	default:
+	}
+}
+
+func (e *Endpoint) loopMonitor() {
+	defer e.monitorGroup.Done()
+	for {
+		select {
+		case <-e.monitorWake:
+		case <-e.monitorDone:
+			return
+		}
+		revalidate := e.revalidate.Load()
+		if revalidate {
+			// The expiry discards the handshake in flight, and a responder drops an initiation that arrives within 20ms of the previous one or carries the same timestamp (2^24ns granularity), so a forced handshake right after another initiation would stall until the next retransmission 5s later.
+			select {
+			case <-time.After(50 * time.Millisecond):
+			case <-e.monitorDone:
+				return
+			}
+		}
+		if e.monitors.Load() == 0 {
+			continue
+		}
+		activeDevice := e.activeDevice()
+		if activeDevice == nil {
+			continue
+		}
+		// A revalidation requested after the check above is left for the next wake, which waits before forcing the handshake.
+		revalidate = revalidate && e.revalidate.Swap(false)
+		for _, peer := range e.monitoredPeers(activeDevice, revalidate) {
+			if revalidate {
+				peer.ExpireCurrentKeypairs()
+			}
+			peer.SendHandshakeInitiation(false)
+		}
+	}
+}
+
+func (e *Endpoint) activeDevice() *device.Device {
+	e.stateAccess.Lock()
+	defer e.stateAccess.Unlock()
+	if e.suspended.Load() || e.networkPaused || e.pause != nil && e.pause.IsDevicePaused() {
+		return nil
+	}
+	return e.device.Load()
+}
+
+func (e *Endpoint) monitoredPeers(wgDevice *device.Device, all bool) []*device.Peer {
+	e.sessionAccess.Lock()
+	var publicKeys []device.NoisePublicKey
+	for publicKey, state := range e.sessionStates {
+		if all || state != device.PeerSessionEstablished {
+			publicKeys = append(publicKeys, publicKey)
+		}
+	}
+	e.sessionAccess.Unlock()
+	var peers []*device.Peer
+	for _, publicKey := range publicKeys {
+		peer, loaded := wgDevice.LookupActivePeer(publicKey)
+		if loaded {
+			peers = append(peers, peer)
+		}
+	}
+	return peers
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
 	switch event {
 	case pause.EventNetworkPause, pause.EventNetworkWake:
 		go e.updateNetworkPause()
+	case pause.EventDeviceWake:
+		e.wakeMonitor()
 	}
 }
 
@@ -389,6 +548,7 @@ func (e *Endpoint) updateNetworkPause() {
 		wgDevice.Down()
 	} else if !e.suspended.Load() {
 		wgDevice.Up()
+		e.wakeMonitor()
 	}
 }
 

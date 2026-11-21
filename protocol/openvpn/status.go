@@ -8,7 +8,10 @@ import (
 	ovpn "github.com/sagernet/sing-openvpn"
 )
 
-var _ adapter.OpenVPNEndpoint = (*ClientEndpoint)(nil)
+var (
+	_ adapter.OpenVPNEndpoint             = (*ClientEndpoint)(nil)
+	_ adapter.OutboundWithConnectionState = (*ClientEndpoint)(nil)
+)
 
 func (c *ClientEndpoint) OpenVPNStatus() adapter.OpenVPNStatus {
 	var status adapter.OpenVPNStatus
@@ -44,6 +47,26 @@ func (c *ClientEndpoint) OpenVPNStatus() adapter.OpenVPNStatus {
 		status.State = adapter.OpenVPNStateConnecting
 	}
 	return status
+}
+
+func (c *ClientEndpoint) ConnectionState() adapter.ConnectionState {
+	switch c.OpenVPNStatus().State {
+	case adapter.OpenVPNStateConnected:
+		return adapter.ConnectionStateConnected
+	case adapter.OpenVPNStateError:
+		return adapter.ConnectionStateFailed
+	default:
+		return adapter.ConnectionStateDisconnected
+	}
+}
+
+func (c *ClientEndpoint) ConnectionStateUpdated() <-chan struct{} {
+	return c.StatusUpdated()
+}
+
+// The client keeps its session established and restarts it on network changes by itself.
+func (c *ClientEndpoint) MonitorConnection() func() {
+	return func() {}
 }
 
 func (c *ClientEndpoint) StatusUpdated() <-chan struct{} {

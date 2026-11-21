@@ -11,7 +11,10 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
-var _ adapter.OpenConnectEndpoint = (*Endpoint)(nil)
+var (
+	_ adapter.OpenConnectEndpoint         = (*Endpoint)(nil)
+	_ adapter.OutboundWithConnectionState = (*Endpoint)(nil)
+)
 
 func (e *Endpoint) OpenConnectStatus() adapter.OpenConnectStatus {
 	var status adapter.OpenConnectStatus
@@ -80,6 +83,26 @@ func (e *Endpoint) OpenConnectStatus() adapter.OpenConnectStatus {
 		status.State = adapter.OpenConnectStateConnecting
 	}
 	return status
+}
+
+func (e *Endpoint) ConnectionState() adapter.ConnectionState {
+	switch e.OpenConnectStatus().State {
+	case adapter.OpenConnectStateConnected:
+		return adapter.ConnectionStateConnected
+	case adapter.OpenConnectStateError:
+		return adapter.ConnectionStateFailed
+	default:
+		return adapter.ConnectionStateDisconnected
+	}
+}
+
+func (e *Endpoint) ConnectionStateUpdated() <-chan struct{} {
+	return e.StatusUpdated()
+}
+
+// The client keeps its session established and restarts it on network changes by itself.
+func (e *Endpoint) MonitorConnection() func() {
+	return func() {}
 }
 
 func (e *Endpoint) StatusUpdated() <-chan struct{} {

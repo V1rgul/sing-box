@@ -32,6 +32,7 @@ var (
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
 	_ adapter.OutboundWithMultiplex       = (*Endpoint)(nil)
 	_ adapter.OnDemandEndpoint            = (*Endpoint)(nil)
+	_ adapter.OutboundWithConnectionState = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 )
 
@@ -185,6 +186,21 @@ func (w *Endpoint) OnDemand() bool {
 
 func (w *Endpoint) SetKeepIdleConnections(keep bool) {
 	w.endpoint.SetIdle(!keep)
+}
+
+func (w *Endpoint) ConnectionState() adapter.ConnectionState {
+	if w.endpoint.Connected() {
+		return adapter.ConnectionStateConnected
+	}
+	return adapter.ConnectionStateDisconnected
+}
+
+func (w *Endpoint) ConnectionStateUpdated() <-chan struct{} {
+	return w.endpoint.ConnectedUpdated()
+}
+
+func (w *Endpoint) MonitorConnection() func() {
+	return w.endpoint.Monitor()
 }
 
 func (w *Endpoint) updateBind(ctx context.Context) {
